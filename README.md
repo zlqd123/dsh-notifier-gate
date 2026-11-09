@@ -231,6 +231,12 @@ bundle 自带的 `cordis.patch.yml` 会插入默认行（`channels: []`）。**�
 
 ---
 
+## 相关项目
+
+- **[zlqd123/noti-gateway](https://github.com/zlqd123/noti-gateway)**——统一通知网关：本插件出站的唯一投递目标（`POST /n/{source}`），另提供 SSE 事件流、失败死信与私聊归档（chatdownload）。服务端部署与协议细节见其[接入文档](https://github.com/zlqd123/noti-gateway/blob/main/接入文档.md)。
+
+---
+
 ## 许可
 
 MIT。核心逻辑来自 [`dsh-notifier`](https://github.com/THEWOLFWALKER/dsh-notifier)（MIT），第三方声明见 `THIRD_PARTY_NOTICES.md`。
