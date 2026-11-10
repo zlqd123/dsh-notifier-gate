@@ -684,6 +684,61 @@ export function createQuestionBridge(deps, strings) {
     return { ok: true, message: t.skippedFeedback }
   }
 
+  /** GUI 先答的跨端结算（waterfall 下游胜出经 abort reason 回灌，2026-11-10 多端同步
+   *  回归修复）：把 Web 侧答案按「先答先算」结算进 aq 行并唤醒 waitPromise，让
+   *  askQuestions 的常规收尾把已推卡片改「✅ 已作答：…（来源 web）」/「⏭ 已跳过」——
+   *  绝不把 Web 作答误标成「⏹ 已终止」。直连 settle/settleText 同款原语（I5 durable
+   *  first-winner：ledger.resolve 先落账、bus.settle 后唤醒）；不经
+   *  control.handle('question-answer')（那是手机/管理台入口，回灌会绕过授权语义）。
+   *  GUI 答案形如 {id, selected: 选项 label[], custom?}：单选 + custom 与 GUI
+   *  composer 同语义（custom 优先、丢弃 selected），多选两者一并呈现；空答案
+   *  （跳过/未答）→ skipped 语义（交还桌面、绝不编造），绝不伪装已作答。
+   *  @returns {boolean} 是否已按真实终态收尾（false → 调用方终止兜底） */
+  function settleFromWeb(qKey, question, qIndex, guiAnswers) {
+    const row = ledger.get(qKey)
+    if (row === undefined) return false
+    // 行已有终态（QQ 侧首达已采纳/已终止）：不覆盖，常规收尾按既有终态呈现即可。
+    if (row.status !== 'pending') return true
+    const list = Array.isArray(guiAnswers) ? guiAnswers : []
+    const qId = String(question?.id ?? '')
+    const entry = (qId !== '' ? list.find((a) => String(a?.id ?? '') === qId) : undefined) ?? list[qIndex]
+    const selected = Array.isArray(entry?.selected) ? entry.selected.map((v) => String(v)).filter((v) => v !== '') : []
+    const optIdxes = selected.map((label) => row.options.indexOf(label)).filter((idx) => idx >= 0)
+    const useIdxes = row.multiSelect === true ? optIdxes : optIdxes.slice(0, 1)
+    const webAs = { channel: 'web', userId: 'web' }
+    const safe = sanitizeAnswerText(typeof entry?.custom === 'string' ? entry.custom : '')
+    if (safe.removed > 0) {
+      warn(`${qKey} Web 作答含 ${safe.removed} 个控制/零宽字符，已过滤（S-07 注入边界）`)
+    }
+    const custom = safe.tooLong ? '' : safe.text.trim()
+    // 首达已被采纳（QQ 同刻作答，ledger/赢家已 settle）→ 无事可做，收尾按赢家终态呈现。
+    const handled = (result) => result === true
+      || result === 'already-resolved' || result === 'already-claimed'
+      || (result !== null && typeof result === 'object' && (result.ok === true || result.reason === 'already-resolved'))
+    if (custom !== '' && (row.multiSelect !== true || useIdxes.length === 0)) {
+      // 单选 + 自定义：与 GUI composer 同语义（custom 优先）；或有自定义但 label
+      // 全部无法对位行选项 → 纯自定义。
+      return handled(settleText(qKey, custom, webAs))
+    }
+    if (useIdxes.length > 0) {
+      if (custom === '') return handled(settle(qKey, row, useIdxes, 'web', 'web'))
+      // 多选 + 自定义：GUI 两者都保留——answers 携带 labels + 自定义文本（不置
+      // custom 位，finalTextOf 走 answeredWithLabelsVia，卡片可见全部内容）。
+      const answersAll = [...useIdxes.map((idx) => row.options[idx]), custom]
+      const committed = ledger.resolve(qKey, 'answered', { answers: answersAll, via: 'web', userId: 'web' })
+      if (committed !== true) return handled(committed)
+      bus.settle(qKey, { kind: 'aq', idxs: useIdxes }, 'web', 'web')
+      warn(`${qKey} 作答：${answersAll.join('、')}（via web）`)
+      return true
+    }
+    // GUI 空答案（跳过/未答）→ skipped 语义（交还桌面、绝不编造），绝不伪装已作答。
+    const committedSkip = ledger.resolve(qKey, 'skipped', { via: 'web', userId: 'web' })
+    if (committedSkip !== true) return handled(committedSkip)
+    bus.settle(qKey, { kind: 'aq-skip', idxs: [] }, 'web', 'web')
+    warn(`${qKey} 已跳过（via web）`)
+    return true
+  }
+
   // ———————————————— 管理台待决问题 facade（路线图阶段 2A，2026-08-26） ————————————————
   // 本块是 admin/UI 与问题桥之间的最小兼容门面：`adminPending()` 只做脱敏只读快照，
   // `adminSettle()` 把裁决一律经注入的 Control Core `deps.control.handle()` 路由——
@@ -1096,7 +1151,7 @@ export function createQuestionBridge(deps, strings) {
     const results = []
     let allAnswered = true
     const agentId = execContext?.agent?.id ?? execContext?.agent?.session?.id ?? execContext?.session?.id ?? null
-    for (const question of questions) {
+    for (const [qIndex, question] of questions.entries()) {
       if (disposed || execContext.signal?.aborted === true) {
         results.push({ question: String(question?.question ?? ''), answered: false, reason: 'stopped' })
         allAnswered = false
@@ -1141,8 +1196,13 @@ export function createQuestionBridge(deps, strings) {
         })
         // 拦截器范围取消信号——注册必须先于任何投递启动
         // （webFirstMs=0 的直投路径 launchPush() 之前就要挂好）。abort 时：清延迟推卡/
-        // 停升级（cancelDelivery）、**先**终结账本行（bus.abandon 默认 manual reason 不
-        // 触发 onAbandon——必须显式 terminate）、再 abandon 等待。
+        // 停升级（cancelDelivery）；GUI 先答（reason.kind='downstream-win'，随 abort
+        // 携带 Web 答案批次）→ settleFromWeb 按「先答先算」把在途问题结算成 answered
+        // （via web）/skipped，bus.settle 唤醒 waitPromise 走常规收尾——已推卡片改
+        // 「✅ 已作答：…（来源 web）」，绝不误标「⏹ 已终止」（2026-11-10 多端同步回归）。
+        // 其余取消（会话销毁/下游死亡/显式中止）保持终止语义：**先**终结账本行
+        // （bus.abandon 默认 manual reason 不触发 onAbandon——必须显式 terminate）、
+        // 再 abandon 等待。
         // 取消保证（诚实表述）：取消后不再「发起」任何新投递（卡/广播/编号话术）；
         // 在途 HTTP 发送不可撤回，迟到成功的投递由 runPush 收尾路径按终态 best-effort 编辑。
         let onAbort = null
@@ -1150,6 +1210,12 @@ export function createQuestionBridge(deps, strings) {
         if (signal !== undefined && signal !== null && typeof signal.addEventListener === 'function') {
           onAbort = () => {
             cancelDelivery()
+            const reason = signal.reason
+            if (reason !== null && typeof reason === 'object' && reason.kind === 'downstream-win') {
+              // GUI 真答案 → 跨端结算；返回 true 表示行已按真实终态收尾（waiter 已被
+              // 唤醒/已有赢家终态），绝不再终止账本行。
+              if (settleFromWeb(qKey, question, qIndex, reason.answers) === true) return
+            }
             terminateDurable(qKey)
             try { bus.abandon(qKey) } catch { /* 已终结则忽略 */ }
           }

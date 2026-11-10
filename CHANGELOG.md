@@ -1,3 +1,44 @@
+## [0.13.1-qq.16]
+
+修复「GUI 先答时 QQ 卡片误标 ⏹ 已终止」——多端同步作答回归（QQ→宿主一直正常，GUI→QQ 断了）。
+
+### 根因
+
+`user-questions/request` waterfall 拦截器与 GUI answerer 双面抢答，GUI 先答时拦截器
+`controller.abort()` 收尾本侧等待，而 askQuestions 的 onAbort 一律
+`terminateDurable + bus.abandon`——账本行被终结成 `terminated`，已推 QQ 卡片改
+「⏹ 已终止：agent 会话已结束，提问取消」，可实际上宿主拿到了 GUI 答案、会话正常
+继续。事故行 `aq:c00eda90`（20:40:23 提问、20:41:31 terminated，68 秒远早于 5 分钟
+超时）即该路径。DSH 核心代码未改动（全树无 2026-11-07 之后的修改），断点只在
+插件侧 GUI→QQ 收尾维度。
+
+### 修复
+
+- GUI 胜出时把 Web 答案批次随 `abort` reason 传入（`{kind:'downstream-win', answers}`），
+  onAbort 据此走新增 `settleFromWeb`：按「先答先算」把在途问题结算成 answered
+  （via web）/skipped 并 `bus.settle` 唤醒 waitPromise——常规收尾把已推卡片改
+  「✅ 已作答：…（来源 web）」/「⏭ 已跳过」，绝不误标终态
+  （`src/questions/router.mjs` + `src/host/native-questions.mjs`）。
+- 答案对位：payload 问题带 `id`（GUI 答案批次按 id 对位在途行，索引兜底）；选项 label
+  按行选项映射下标，custom 走 aq-text（单选 custom 优先、多选两者一并呈现）；
+  空答案 → skipped 语义（交还桌面、绝不编造），绝不伪装已作答。
+- 首达不覆盖：行已有终态（QQ 同刻作答）时不改写，收尾仍按赢家终态呈现；结算直连
+  settle/settleText 同款原语（ledger.resolve 先落账、bus.settle 后唤醒），不经
+  `control.handle('question-answer')`（避免绕过授权语义与回环）。
+- 其余取消（会话销毁/下游死亡/显式中止）终止语义不变；迟到投递收尾共享 finalTextOf，
+  按真实终态呈现。
+
+### 验证
+
+- 真实链路实测（2026-11-10 07:58，Web GUI 先答）：`ask_user_question` 实测题在网页端选「同意」后，
+  `state.json` 新行 `aq:8e74248d` 落账 `decision:"answered"`, `via:"web"`, `userId:"web"`,
+  `answers:["同意"]`，作答后 28 秒内结账——非 5 分钟兜底、非 `terminated`，GUI→QQ 同步恢复。
+  QQ 卡片按 `finalTextOf` 收尾为「✅ 已作答：同意（来源 web）」（同一收尾通道此前已实测编辑生效）。
+- 回归对照：QQ 端先答（`via:"qq:button"` / `qq:text`）行为不变（`aq:6523281c`、`aq:d77e828f`）；
+  旧缺陷样本 `aq:c00eda90`（GUI 先答误落 `terminated`）作为根因证据保留。
+
+---
+
 ## [0.13.1-qq.15]
 
 修复「同一答案收到两条回执」，并整理 README（QQ 消息审核机制、真实配额、网关部署坑位）。
