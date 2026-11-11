@@ -66,14 +66,14 @@ check(s === 401, `错误密钥 -> 401 (实际 ${s})`)
   check(r.status === 401, `换体 -> 401 (实际 ${r.status})`)
 }
 
-// 5. 旧 token 通道仍通（不带签名）
+// 5. 旧 token 通道已删（不带签名一律 401）
 {
   const r = await fetch(`${GW}/n/ci`, {
     method: 'POST',
     headers: { 'content-type': 'application/json; charset=utf-8', authorization: 'Bearer e2e-old-token', 'x-source': 'ci' },
     body,
   })
-  check(r.status === 202, `旧 token 通道 -> 202 (实际 ${r.status})`)
+  check(r.status === 401, `无签名旧 token 调用 -> 401 (实际 ${r.status})`)
 }
 
 // 6. 无凭据 -> 401
