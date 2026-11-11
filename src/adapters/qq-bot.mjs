@@ -77,16 +77,22 @@ function signHmac(resolved) {
 }
 
 /** 经统一网关（noti-gateway）投递纯推送：汇入统一配额池（落盘+重试+死信）。
- *  成功返回 true；失败打 stderr 日志并返回 false，由调用方回退直连。 */
+ *  msg 可带 image/file 富媒体（{b64,mime?,name?} 内联 或 {ref} 引用 /u/* 分片上传件），
+ *  原样透传给网关的 image/file 字段；纯媒体消息不硬造标题。 */
 async function sendViaGateway(resolved, msg) {
+  const media = {}
+  if (msg.image) media.image = msg.image
+  if (msg.file) media.file = msg.file
+  const hasMedia = Boolean(media.image || media.file)
   const text = msg.title.length > 0 ? `${msg.title}\n${msg.content}` : msg.content
   const lines = text.split('\n')
-  const title = (lines[0] ?? '').trim().slice(0, 100) || '(无标题)'
+  const title = (lines[0] ?? '').trim().slice(0, 100) || (hasMedia ? '' : '(无标题)')
   const body = lines.slice(1).join('\n').trim()
   try {
     await postJson(`${resolved.gatewayUrl}/n/${encodeURIComponent(resolved.gatewaySource)}`, {
       title,
       body,
+      ...media,
     }, {
       headers: { authorization: `Bearer ${resolved.gatewayToken}`, 'x-source': resolved.gatewaySource },
       // 填了 HMAC 密钥即签名校验（网关优先走 HMAC）；否则回退旧 token 通道
