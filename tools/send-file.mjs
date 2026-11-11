@@ -73,7 +73,7 @@ export async function runSend(forceKind) {
   const mime = (kind === 'image' ? IMAGE_MIME[ext] : (IMAGE_MIME[ext] || FILE_MIME[ext])) || 'application/octet-stream'
   if (kind === 'image' && !IMAGE_MIME[ext]) die(`不是支持的图片类型 ${ext || '(无扩展名)'}，支持: ${Object.keys(IMAGE_MIME).join(' ')}`)
 
-  const api = async (path, { method = 'POST', body = Buffer.alloc(0), json, headers = {}, timeoutMs = 15000 } = {}) => {
+  const api = async (path, { method = 'POST', body = Buffer.alloc(0), json, headers = {}, timeoutMs = 30000, soft = false } = {}) => {
     const payload = json !== undefined ? Buffer.from(JSON.stringify(json), 'utf8') : body
     const r = await fetch(`${gateway}${path}`, {
       method,
@@ -86,7 +86,11 @@ export async function runSend(forceKind) {
       signal: AbortSignal.timeout(timeoutMs),
     })
     const out = await toJson(r)
-    if (!r.ok) die(`${method} ${path} HTTP ${r.status}: ${JSON.stringify(out)?.slice(0, 200)}`)
+    if (!r.ok) {
+      const msg = `${method} ${path} HTTP ${r.status}: ${JSON.stringify(out)?.slice(0, 200)}`
+      if (soft) throw new Error(msg)
+      die(msg)
+    }
     return out
   }
 
@@ -101,7 +105,20 @@ export async function runSend(forceKind) {
     const { upload_id: uploadId, chunk_size: chunkSize, chunks } = init
     for (let i = 0; i < chunks; i++) {
       const part = bytes.subarray(i * chunkSize, (i + 1) * chunkSize)
-      await api(`/u/${uploadId}/part/${i}`, { method: 'POST', body: part, timeoutMs: 60000 })
+      let lastErr = null
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await api(`/u/${uploadId}/part/${i}`, { method: 'POST', body: part, timeoutMs: 300000, soft: true })
+          lastErr = null
+          break
+        } catch (e) {
+          lastErr = e
+          process.stderr.write(`[send-file] 分片 ${i + 1}/${chunks} 第 ${attempt} 次失败: ${e?.message || e}\n`)
+          await new Promise((r) => setTimeout(r, 2000 * attempt))
+        }
+      }
+      if (lastErr) throw lastErr
+      process.stderr.write(`[send-file] 分片 ${i + 1}/${chunks} ok\n`)
     }
     const done = await api(`/u/${uploadId}/complete`, { json: {} })
     media = { ref: done.ref }
