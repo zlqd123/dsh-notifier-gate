@@ -35,6 +35,9 @@ import { createInteractionLedger } from '../interaction/ledger.mjs'
 import { createRateLimiter, compileParameters } from '../tool-register.mjs'
 // 维护批 6 前置：跨渠道能力矩阵作为单一事实来源
 import { isCoveredByOutbound, toInboundChannelName } from '../inbound/capability-matrix.mjs'
+// 问题卡片根因修复（0.13.1-qq.17）：ask_user 优先走宿主原生 user-questions/request 瀑布，
+// 让网页 GUI 问题卡片与 QQ 卡片同时出（先答为准）；seam 缺失才退回 aq 桥（仅 QQ）。
+import { readUserQuestions } from '../host/capability.mjs'
 
 const KEY_PREFIX = 'aq:'
 
@@ -1371,7 +1374,10 @@ export function validateAskArgs(rawArgs, { minTimeoutMs = 30_000, maxTimeoutMs =
       if (label === '' || label.length > 60) {
         return { ok: false, reason: `问题「${question.slice(0, 20)}」的选项 label 必须是 1-60 字符` }
       }
-      options.push({ label })
+      // 选项 description 保留（可选）：原生 seam 出卡时网页端显示灰字提示、
+      // QQ 卡片经 hostAsk 折进上下文，避免双端出卡丢细节。
+      const description = String(option?.description ?? '').trim()
+      options.push(description === '' ? { label } : { label, description })
     }
     questions.push({ question, options, multiSelect: item?.multiSelect === true })
   }
@@ -1381,6 +1387,74 @@ export function validateAskArgs(rawArgs, { minTimeoutMs = 30_000, maxTimeoutMs =
     : defaultTimeoutMs
   const context = String(args.context ?? '').slice(0, 300)
   return { ok: true, questions, timeoutMs, context }
+}
+
+/**
+ * 把 ask_user 请求映射到宿主原生 user-questions/request 瀑布（0.13.1-qq.17 根因修复）：
+ * 网页 GUI 问题卡片由下游渲染、QQ 卡片由 native-questions 拦截器经 aq 桥推送，
+ * 首达采纳、GUI 先答回灌（settleFromWeb）全部复用既有机制——两个提问工具出卡效果一致，
+ * 模型选哪个都不再影响网页问题卡片。
+ * @returns {Promise<object|null>} ask_user 输出形状；seam 缺失或调用前失败返回 null
+ *   （调用方退回 aq 桥，仅 QQ 出卡）；用户取消返回明确失败对象（问题可能已出卡，
+ *   绝不退回重复出题）。
+ */
+async function askViaNativeSeam(ctx, validated, execContext) {
+  const uq = readUserQuestions(ctx)
+  if (uq === null || typeof uq.ask !== 'function') return null
+  const agent = execContext?.agent
+  if (agent === undefined || agent === null) return null // 无 agent 卡片无法归属会话，退回 aq 桥
+  const callId = typeof execContext?.callId === 'string' ? execContext.callId : null
+  const request = {
+    questions: validated.questions.map((item, idx) => ({
+      id: `q${idx + 1}`,
+      question: item.question,
+      options: item.options.map((option) => (
+        option.description === undefined
+          ? { label: option.label }
+          : { label: option.label, description: option.description }
+      )),
+      multiSelect: item.multiSelect,
+    })),
+    // context / timeoutMs 为 ask_user 附加字段（原生 ask_user_question 请求没有）：
+    // hostAsk 把它们透传给 questionBridge，QQ 卡片引言与前台等待共用同一时限。
+    context: validated.context,
+    timeoutMs: validated.timeoutMs,
+    agent,
+  }
+  if (execContext?.signal !== undefined) request.signal = execContext.signal
+  if (callId !== null) request.wait = { callId }
+  let result
+  try {
+    // askTimed：前台等待到期返回 { pending:true }（超时不代答），卡片仍可继续作答；
+    // 无 callId 或旧宿主无 askTimed 时退回 ask()（等到作答或信号取消）。
+    result = callId !== null && typeof uq.askTimed === 'function'
+      ? await uq.askTimed(request, callId, validated.timeoutMs)
+      : await uq.ask(request)
+  } catch (error) {
+    const code = error?.code
+    if (code === 'ASK_ABORTED' || code === 'ASK_CANCELLED') {
+      // 用户取消了这次调用：问题可能已在网页出卡，绝不退回 aq 桥重复出题
+      return { ok: false, answered: false, results: [], reason: '提问已被取消' }
+    }
+    return null // 调用前失败（无应答方 / agent 不匹配等）→ 退回 aq 桥
+  }
+  const unanswered = () => validated.questions.map((item) => ({ question: item.question, answered: false, answers: [] }))
+  if (result?.pending === true) {
+    return { ok: true, answered: false, results: unanswered() }
+  }
+  const rawAnswers = Array.isArray(result?.answers) ? result.answers : []
+  const byId = new Map()
+  for (const entry of rawAnswers) {
+    if (entry !== null && typeof entry === 'object' && typeof entry.id === 'string') byId.set(entry.id, entry)
+  }
+  const results = validated.questions.map((item, idx) => {
+    const entry = byId.get(`q${idx + 1}`) ?? rawAnswers[idx] ?? null
+    const selected = Array.isArray(entry?.selected) ? entry.selected.map(String) : []
+    const custom = typeof entry?.custom === 'string' && entry.custom !== '' ? entry.custom : ''
+    const answers = custom === '' ? selected : [...selected, custom]
+    return { question: item.question, answered: answers.length > 0, answers }
+  })
+  return { ok: true, answered: results.every((item) => item.answered), results }
 }
 
 /**
@@ -1397,7 +1471,7 @@ export function registerAskUserTool(ctx, bridge, options = {}) {
   const limiter = createRateLimiter({ limitPerMinute: options.rateLimitPerMinute ?? 6 })
   return ctx.tools.register({
     name: 'ask_user',
-    description: '向用户提出选择题并等待作答（推送到用户手机：飞书选项卡片 / Telegram 按钮 / 其他渠道回复编号）。适合方案抉择、环境选择等需要用户拍板的分叉决策；用户装了 dsh-notifier 手机桥接时优先用本工具而不是 ask_user_question。超时不会代答——用户未作答时返回 answered=false，请改用桌面确认或调整方案继续。',
+    description: '向用户提出选择题并等待作答：网页会话弹出问题卡片，同时推送用户手机（飞书选项卡片 / Telegram 按钮 / 其他渠道回复编号），两端同步、先答为准。适合方案抉择、环境选择等需要用户拍板的分叉决策；与 ask_user_question 出卡效果一致，任选其一即可。超时不会代答——用户未作答时返回 answered=false，请改用桌面确认或调整方案继续。',
     parameters: compileParameters({
       questions: {
         type: 'array',
@@ -1443,6 +1517,10 @@ export function registerAskUserTool(ctx, bridge, options = {}) {
         return { ok: false, answered: false, results: [], reason: validated.reason }
       }
       try {
+        // 双端出卡优先：走宿主原生 seam（网页问题卡片 + QQ 卡片同时出、先答为准）；
+        // seam 缺失/调用前失败返回 null，退回 aq 桥（仅 QQ 出卡，行为同旧版）。
+        const native = await askViaNativeSeam(ctx, validated, execContext)
+        if (native !== null) return native
         return await bridge.askQuestions(validated, execContext)
       } catch (error) {
         return { ok: false, answered: false, results: [], reason: error instanceof Error ? error.message : String(error) }

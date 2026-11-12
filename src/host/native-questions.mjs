@@ -110,8 +110,15 @@ export function createNativeQuestionBridge(deps = {}) {
         options: entry.options.labels.map((label) => ({ label })),
         multiSelect: entry.multiSelect,
       })),
-      context: normalized.map((entry) => entry.detail).filter((part) => part !== '').join('\n'),
-      // 原生提问超时由 questionBridge 的默认策略兜底（宿主 signal 取消见 review 收口）。
+      context: [String(request?.context ?? ''), ...normalized.map((entry) => entry.detail)]
+        .filter((part) => part !== '').join('\n'),
+    }
+    // ask_user 经本 seam 出题时会带上 timeoutMs（原生 ask_user_question 请求没有该字段）：
+    // 透传给 questionBridge，让 QQ 卡片作答时限与 askTimed 前台等待共用同一时限；
+    // 缺失时由 questionBridge 默认策略兜底（宿主 signal 取消见 review 收口）。
+    const requestTimeoutMs = Number(request?.timeoutMs)
+    if (Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0) {
+      payload.timeoutMs = requestTimeoutMs
     }
     let outcome
     try {
