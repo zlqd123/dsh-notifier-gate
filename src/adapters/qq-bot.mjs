@@ -44,7 +44,9 @@ export function resolve(cfg = {}) {
     appSecret,
     targetType,
     targetId,
-    timeoutMs: num(cfg.timeoutMs, 10000, 1000, 60000),
+    // 30s：QQ 官方机器人实际投递延迟常达 9–18s，10s 会误报「投递超时，结果未知」
+    //（消息多半已送达），故默认放宽到 30s；可用配置 timeoutMs 覆盖。
+    timeoutMs: num(cfg.timeoutMs, 30000, 1000, 60000),
   }
 }
 
