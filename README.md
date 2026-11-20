@@ -101,7 +101,9 @@ function runStateOf(resolved) {
 > **改名残留说明**：包名已从 `dsh-notifier-qq` 改为 `dsh-notifier-gate`。凡是**按包名匹配**的标识都必须跟着改，否则表现为「装了但不加载」：
 > package.json `name`、`cordis.patch.yml` 的 `id` 与 `insert.name`、`client.js` 里 `__ModuleLoader__.load({ id })`（前端按包名取模块，id 不对就是 `import failed`）、`plugins.bundle.config` / `plugins.bundle.activation` 插槽的 `key`（插件管理器按 `pkg.name` 匹配，key 不对配置页就是空白）。
 >
-> 仍沿用旧名、**故意不改**的运行时标识：默认 state 目录 `~/.dsh/dsh-notifier-qq/`、host↔client 的 RPC 通道 `/dsh-notifier-qq`（`src/control-surface/rpc.mjs` 与 `client.js` 写死同一串，自洽）、面板 `PANEL_ID` 与 locale 命名空间。改这些要两端一起改且会丢现有状态。
+> 仍沿用旧名、**故意不改**的运行时标识：默认 state 目录 `~/.dsh/dsh-notifier-qq/`、locale 命名空间。
+> （曾与 `client.js` 成对的 host↔client RPC 通道 `/dsh-notifier-qq` 已随 control-surface
+> 一并移除，见下方「精简（qq.18）」。改这些要两端一起改且会丢现有状态。）
 
 ---
 
@@ -226,8 +228,43 @@ bundle 自带的 `cordis.patch.yml` 会插入默认行（`channels: []`）。**�
 ## 裁剪范围
 
 - 模块：120 → 85（`config.mjs` 只留 `qq-bot` 注册表；入站 `INBOUND_CHANNELS` 只剩 `qq`；五个渠道适配器、五个入站 transport、扫码流、声明表引擎全部移除）。
+- 精简（qq.18）：85 → 71（自建 Web 管理台 `src/admin/*` 与 Native Control Surface `src/control-surface/*` 整体移除；仅 `apply-mode` / `channel-config-migration` 两个被主链引用的模块迁至 `src/assembly/`。出站推送、入站审批/提问、路由、账本不受影响。管理台曾提供的静音配置改由 DSH 原生插件设置页承载，见「静音规则（插件页）」）。
 - 无死代码：从 `src/plugin-entry.mjs` 出发可达性分析，全部可达。
-- 运行时依赖：0（不再需要读 YAML——配置由宿主 cordis 解析后作为 `config` 传入；原先用于读原插件 patch 的 `src/compat/` 已随「配置自持」一并移除）。
+- 运行时依赖：`@deepseek-ai/schemastery`（仅 `Config` schema 声明用，宿主 profile 已提供；其余逻辑 0 依赖——配置由宿主 cordis 解析后作为 `config` 传入；原先用于读原插件 patch 的 `src/compat/` 已随「配置自持」一并移除）。
+
+---
+
+## 静音规则（插件页可视化配置）
+
+插件自带一个 DSH 原生插件页配置卡片（`plugins.bundle.config` / `plugins.row.config`），
+自动读取当前 DSH 的工作区与会话列表，按项目/会话勾选「静音 / 放行 / 默认」。
+数据面真值是 volatile 配置字段 `muteRules`，写进 profile 的 `cordis.patch.yml`：
+
+```yaml
+- id: dsh-notifier-gate
+  config:
+    muteRules:
+      workspace2: true            # 项目（workspace basename）整体静音
+      session-abc: false          # 精确会话显式放行（优先于项目）
+      session-xyz: [qq-bot]       # 白名单：只推这些渠道
+```
+
+- 出站解析优先级：**muteRules（会话键 > 项目键）> route:sessions diff > 精确 agentId > workspace > 全局渠道池**。
+  muteRules 命中即终止（source 标 `mute-rules`），未命中保持原链路，存量用户零感知。
+- `muteRules` 为 `.volatile()`：设置页保存即热生效，不重启插件、不重建事件监听。
+- 静音只拦自动推送；入站回复、审批、远程提问不受影响。
+
+### 子智能体静音（events.subagent）
+
+子智能体会话（`session.header.origin === 'subagent'`，判定只认 `origin`——
+`parentSession` 存在与否不定性）的**一切出站推送默认静音**：turn/end 完成/失败、
+心跳、卡住提醒、错误都不再推送，也不再写 route:sessions 台账。
+显式打开才与普通会话同链处理：
+
+```yaml
+    events:
+      subagent: true    # 默认关；打开后子会话事件照常推送（仍受 kinds/muteRules/routing 约束）
+```
 
 ---
 

@@ -16,11 +16,23 @@ import { guardTargets } from './inbound/target-guard.mjs'
 import { maskSecrets, normalizeRedaction, MINIMAL_EXCERPT_CHARS } from './redact.mjs'
 // lang: 'zh' | 'en' 自动推送文案表（未知值回落 zh）
 import { stringsOf } from './strings.mjs'
+// 静音规则：设置页 volatile muteRules 覆盖出站解析（会话/项目粒度静音与白名单）
+import { resolveMuteRule } from './mute-rules.mjs'
 
 /** 取会话所属工作区名：cwd 末段，否则 session id。 */
 export function workspaceNameOf(session) {
   const cwd = session?.header?.cwd
   return cwd !== undefined && typeof cwd === 'string' && cwd.length > 0 ? basename(cwd) : String(session?.id ?? '')
+}
+
+/**
+ * 子智能体会话判定：以 session header 的 `origin === 'subagent'` 为唯一依据
+ * （dsh-session types 明确：parentSession 存在与否不定性，fork 历史字段可能残留，
+ * 判定一律看 origin）。header 缺失/形态异常返回 false——与「未知不当子智能体
+ * 误杀」的保守语义一致，主会话永远不被此判定吞掉。
+ */
+export function isSubagentSession(session) {
+  return session?.header?.origin === 'subagent'
 }
 
 /** G-18：6 位十六进制负载摘要（dedup 键追加用，与 wxpusher hash6 同法）。 */
@@ -288,8 +300,14 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
   // lang 文案表：resolvedConfig.lang 已归一（未知值回落 zh），此处不再兜底
   const strings = stringsOf(resolvedConfig.lang)
   const events = resolvedConfig.events ?? { turnEnd: { enabled: true, kinds: {} }, approval: true, agentError: true }
+  // 子智能体推送开关：config 已归一为布尔（缺省 false = 默认静音）；旧调用方
+  // 直传未归一 events 时按从严判定（缺失即关——默认静音方向与文档一致）。
+  const subagentEnabled = events.subagent === true
+    || (events.subagent !== null && typeof events.subagent === 'object' && events.subagent.enabled === true)
   const router = wiring.router ?? null
   const registry = wiring.registry ?? null
+  // 设置页静音规则（volatile ref，带 .get()）；每次出站解析时重新读取。
+  const muteRulesRef = wiring.muteRules ?? null
   const busFn = typeof wiring.bus === 'function' ? wiring.bus : null
   // v0.5 动作闭环（全可选、惰性求值；调用点自带 try/catch + null 判定）
   const actionsFn = typeof wiring.actions === 'function' ? wiring.actions : null
@@ -341,14 +359,49 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
    * router 缺失 / session 无 id / 解析异常一律回落「不过滤、不静音」（广播，向后兼容）。
    */
   const resolveOutboundOf = (session) => {
-    if (router === null || session?.id === undefined || session?.id === null) return {}
+    const sid = session?.id === undefined || session?.id === null ? null : String(session.id)
+    const workspace = workspaceNameOf(session)
+    // 设置页 volatile 静音规则优先于 state.json 路由链：每次调用重新读取，热更新即时生效。
+    // 会话无 id 时仍可按 workspace 名命中项目级静音。
+    let override = null
+    try {
+      override = resolveMuteRule(muteRulesRef, sid ?? '', workspace)
+    } catch { /* 规则解析异常不影响原路由链 */ }
+
+    if (router === null || sid === null) {
+      // 无 router / 无会话 id：仍尽量应用 workspace 级静音规则。
+      if (override !== null) return toSendOptions(override)
+      return {}
+    }
     try {
       const globalTypes = Array.isArray(notifier?.channels) ? notifier.channels : []
-      const resolved = router.resolveOutbound(String(session.id), workspaceNameOf(session), globalTypes)
-      return { channelTypes: resolved.channelTypes, quiet: resolved.quiet }
+      const resolved = router.resolveOutbound(sid, workspace, globalTypes)
+      const merged = applyOverride(resolved, override, globalTypes)
+      return { channelTypes: merged.channelTypes, quiet: merged.quiet }
     } catch (error) {
       warn(`出站路由解析失败，本次按全局广播: ${error instanceof Error ? error.message : String(error)}`)
+      if (override !== null) return toSendOptions(override)
       return {}
+    }
+  }
+
+  /** 把静音规则覆盖合并进路由解析结果：quiet 取规则值；channelTypes 白名单交集到全局池。 */
+  function applyOverride(resolved, override, globalTypes) {
+    if (override === null) return resolved
+    const out = { channelTypes: resolved.channelTypes, quiet: resolved.quiet }
+    if (typeof override.quiet === 'boolean') out.quiet = override.quiet
+    if (Array.isArray(override.channelTypes)) {
+      const pool = Array.isArray(globalTypes) && globalTypes.length > 0 ? globalTypes : resolved.channelTypes
+      out.channelTypes = override.channelTypes.filter((t) => !Array.isArray(pool) || pool.includes(t))
+    }
+    return out
+  }
+
+  /** override 单独作用（无 router 时）转 sendOptions，白名单不过滤（无全局池可依据）。 */
+  function toSendOptions(override) {
+    return {
+      quiet: typeof override.quiet === 'boolean' ? override.quiet : undefined,
+      channelTypes: Array.isArray(override.channelTypes) ? override.channelTypes : undefined,
     }
   }
 
@@ -512,6 +565,12 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
   }
 
   const push = (intent, session) => {
+    // 子智能体总闸（events.subagent，默认关）：默认静音子会话的一切出站推送，
+    // 并且不再 registry.touch 建档（止住 route:sessions 台账被派生子任务灌满）。
+    // 显式 events.subagent: true 打开后走与主会话完全相同的后续链。
+    if (!subagentEnabled && isSubagentSession(session)) {
+      return Promise.resolve(undefined)
+    }
     // v0.5 状态上报文案组装：turn/start / longRunning / stall 三类 intent 的正文
     // 需要 workspace / 运行时长 / 最近输出，intent 纯函数不持有这些，push 侧组装。
     let message

@@ -4,8 +4,7 @@
 
 import { chmodSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { CHANNEL_TYPES, resolveConfig } from './config.mjs'
-import { composeOutboundChannels, accountOf } from './assembly/outbound.mjs'
-import { resolveAdminToken } from './assembly/admin-token.mjs'
+import { composeOutboundChannels } from './assembly/outbound.mjs'
 import { resolveInboundSignals } from './assembly/inbound-signals.mjs'
 import { createNotifier } from './notify.mjs'
 import { createEventListener } from './event-listener.mjs'
@@ -13,7 +12,6 @@ import { registerNotifyTool, registerNotifyTestTool } from './tool-register.mjs'
 import { createLedger, yesterdayWindow } from './ledger.mjs'
 // 阶段 4/5：inbound 回传栈（远程审批 + 会话路由）
 import { createStore, defaultStateDir } from './inbound/store.mjs'
-import { createInboundChannelConfigPort } from './inbound/channel-config.mjs'
 import { createTokenVault } from './inbound/tokens.mjs'
 import { createIdentity } from './inbound/identity.mjs'
 import { createPairing } from './inbound/pairing.mjs'
@@ -34,27 +32,12 @@ import { createAgentRouter } from './routing/agent-router.mjs'
 import { createSessionRegistry } from './routing/session-registry.mjs'
 // v0.10 移动任务选择（歧义前置）：多活跃任务无绑定先下发选择卡；待决状态经 store 持久化
 import { createTaskSelection } from './routing/task-selection.mjs'
-// v0.3.3：Web 管理台（HTTP 壳 + API 函数层 + 单文件 UI + 扫码流机 + 连通性自检）
-import { createAdminApi, INBOUND_CHANNELS } from './admin/api.mjs'
-// v0.4.0：通知事件 hub（SSE 数据源）
-import { createEventHub } from './admin/events.mjs'
-import { createAdminServer } from './admin/server.mjs'
-import { createAdminUiHtml } from './admin/ui.mjs'
-import { runChannelTest } from './health.mjs'
+// 精简版：已移除自建 Web 管理台（admin/*）与 Native Control Surface（control-surface/*）。
+// 项目/会话静音改由 DSH 原生设置页的 volatile muteRules 配置承载（见 config-schema.mjs）。
+// 仅保留启动期出站配置迁移（已迁至 assembly/，与 admin 解耦）。
 import { createOutboundSource } from './runtime/outbound-source.mjs'
 import { createRuntimeChannelManager } from './runtime/channel-manager.mjs'
-import { createSurfaceRevision } from './control-surface/revision.mjs'
-import { createSurfaceActivity } from './control-surface/activity.mjs'
-import { createSurfaceHealth } from './control-surface/health.mjs'
-import { createOutboundConfigService } from './control-surface/outbound-config.mjs'
-import { migrateCanonicalChannelConfig } from './control-surface/channel-config-migration.mjs'
-import { createChannelProjection } from './control-surface/channels.mjs'
-import { createTaskProjection } from './control-surface/tasks.mjs'
-import { createQuestionProjection } from './control-surface/questions.mjs'
-import { createLaunchTickets } from './control-surface/launch-ticket.mjs'
-import { createAdminSessions } from './control-surface/admin-session.mjs'
-import { createControlSurfaceService } from './control-surface/service.mjs'
-import { registerControlSurfaceRpc } from './control-surface/rpc.mjs'
+import { migrateCanonicalChannelConfig } from './assembly/channel-config-migration.mjs'
 // lang 文案表：入站回执 / 晨报标题等手机可见文案取词（未知 lang 已在 resolveConfig 归一回落 zh）
 import { stringsOf } from './strings.mjs'
 import { createLog } from './log.mjs'
@@ -243,73 +226,18 @@ export function apply(ctx, config = {}) {
     initial: overlay.channels,
   })
   resolved.channels = outboundSource.snapshot()
-  const testRawConfigOf = overlay.testRawConfigOf
-  const resolvedOutboundRows = new Map(overlay.channels.map((entry) => [entry.type, entry.config]))
 
-  const surfaceRevision = createSurfaceRevision()
-  const surfaceActivity = createSurfaceActivity()
-  const surfaceHealth = createSurfaceHealth()
-  const launchTickets = createLaunchTickets()
-  const adminSessions = createAdminSessions()
-  let adminListenInfo = null
-  // v0.12.1（P1-03）：Native inbound 读写不再依赖 admin.enabled。
-  // v0.13（C11.5 / R6）：运行时真值查询在 channelRegistry 装配完成后注入（惰性闭包），
-  // 未装配/未启动时返回 null → active=false / restartPending=true（绝不冒充已在线）。
-  let inboundRuntimeOf = null
-  const inboundConfigPort = createInboundChannelConfigPort({
-    store,
-    warn: (message) => warn(`[dsh-notifier-gate/inbound-config] ${message}`),
-    runtime: (type) => (inboundRuntimeOf === null ? null : inboundRuntimeOf(type)),
-  })
-  let surfaceAdminApi = {
-    getChannels: () => inboundConfigPort.rows(),
-    putInboundChannel: (type, patch) => inboundConfigPort.put(type, patch),
-    deleteInboundChannel: (type) => inboundConfigPort.remove(type),
-  }
-
-  const outboundConfigService = createOutboundConfigService({
-    store,
-    yamlRows: yamlRowOf,
-    resolvedRows: resolvedOutboundRows,
-    source: outboundSource,
-    adminEnabled,
-    allowLegacy: false,
-    onChange: (topic) => surfaceRevision.touch(topic),
-    onAudit: (topic, detail) => surfaceActivity.record('configuration', topic, {
-      channel: detail?.type,
-      saved: detail?.saved === true,
-      deleted: detail?.deleted === true,
-      hotApplied: detail?.applied === true,
-    }),
-  })
-
-  // v0.4.0 通知事件 hub（A 路线「管理台通知页」）：admin 开启时 notifier.onSend 旁路进
-  // hub，GET /api/events 以 SSE 实时推给浏览器（系统通知数据源）。admin 关闭零开销——
-  // hub 不创建、onSend 维持 v0.3.3 的账本单挂语义（存量行为逐字节不变）。
-  // notify.mjs 已把 onSend 调用包在 try/catch：账本/hub 任一异常绝不影响推送主链路。
-  const eventHub = adminEnabled ? createEventHub() : null
-  // v0.6 组合器化（设计稿 §3.4）：账本/hub/emit 三挂逐项隔离——甲抛错乙照跑（结构保证，
-  // 取代旧 if/else 依赖「append 与 publish 各自永不抛」的碰巧等价）。全空 → undefined，
-  // 保持 v0.5「digest 关 + admin 关 + emit 关 → onSend=undefined」边界语义不变。
+  // 精简版：自建 Web 管理台与 Native Control Surface 已移除。
+  // onSend 只保留「账本 + sent 事件」两挂（emitSend 内含 emit 开关判定），
+  // 不再有 SSE hub / surface health/activity/revision 旁路。
   const onSend = composeOnSend([
     ledger === null ? null : (record) => ledger.append(record),
-    eventHub === null ? null : (record) => eventHub.publish(record),
-    (record) => {
-      surfaceHealth.recordSend(record)
-      surfaceActivity.recordDelivery(record)
-      surfaceRevision.touch('delivery')
-    },
     emitSend,
   ])
 
   const notifier = createNotifier(ctx, outboundSource, { segment: resolved.segment, routing: resolved.routing, onSend })
 
   const disposers = []
-  // Runtime lifecycle changes are revision-visible without conflating them
-  // with desired config changes.  Consumers still read the live manager.
-  disposers.push(outboundSource.subscribe((event) => {
-    surfaceRevision.touch(event?.topic === 'runtime' ? 'runtime' : 'channels')
-  }))
 
   // v0.6 公共面装配（设计稿 §2.5）：notifier 之后创建 facade 并注册服务。public.enabled:false
   // → stub 形态（push 返回 skipped:(disabled)），服务照常提供（消费插件的启动依赖不能断）。
@@ -381,15 +309,6 @@ export function apply(ctx, config = {}) {
     isActive: ({ sessionId }) => { try { return registry.isActive(sessionId) === true } catch { return false } },
     logger,
   })
-  // v0.10 待关注事项判定器（任务投影 attention + /tasks ⚠ 标记）：question 待决即标 attention。
-  // questionsBridge 晚装配（questions.enabled 块），本闭包惰性读取，装配前恒 false。
-  const attentionOf = (taskRef) => {
-    try {
-      const ids = questionsBridge?.pendingAgentIds?.()
-      return ids instanceof Set && ids.has(String(taskRef))
-    } catch { return false }
-  }
-
   // v0.5 动作闭环的装配时序（架构审查修正，设计稿 §6）：eventListener 装配早于
   // inbound 白名单块（vault/store/通道在其后才创建），直传实例不可行——用惰性
   // getter（先例 = 下方 registerNotifyTool 的 channelTypes: () => ...）。
@@ -408,6 +327,8 @@ export function apply(ctx, config = {}) {
   disposers.push(createEventListener(ctx, notifier, resolved, {
     router,
     registry,
+    // 设置页 volatile 静音规则（config.muteRules 是带 .get() 的 ref；普通对象亦可）。
+    muteRules: config.muteRules ?? null,
     bus: () => busRef,
     actions: () => actionsRef,
     interactive: () => interactiveRaw,
@@ -621,9 +542,7 @@ export function apply(ctx, config = {}) {
       logger,
       warn,
     })
-    const { interactiveInstances, replyTargets, runtimeOf } = channelRegistry
-    // v0.13（C11.5 / R6）：入站 transport 装配成功后把运行时真值查询接进配置端口。
-    inboundRuntimeOf = runtimeOf
+    const { interactiveInstances, replyTargets } = channelRegistry
     disposers.push(() => channelRegistry.dispose())
 
     // v0.6.1：路由注册同样逐个守护——审批/会话路由炸了只丢对应能力，
@@ -750,216 +669,6 @@ export function apply(ctx, config = {}) {
     warn('approval 已配置但没有任何入站通道凭证：远程审批未启动。请先配置任一通道（如 inbound.telegram.botToken 或扫码落盘凭证），启动后经 /pair 配对即可使用')
   }
 
-  // v0.12 Native Control Surface. Existing projections remain the only authorities.
-  const surfaceTasks = createTaskProjection({
-    getTasks: () => {
-      try {
-        return tasksSnapshot({ ctx, registry, router, channelTypes: outboundSource.types(), attentionOf })
-      } catch {
-        return { count: 0, activitySorted: false, tasks: [] }
-      }
-    },
-  })
-  const surfaceQuestions = createQuestionProjection({
-    getQuestions: () => questionsBridge?.adminPending?.() ?? [],
-    settle: (payload) => questionsBridge?.adminSettle?.(payload) ?? { ok: false, reason: 'not_available', message: '问题桥未装配' },
-  })
-  const surfaceChannels = {
-    list: () => createChannelProjection({
-      outboundSource,
-      outboundConfig: outboundConfigService,
-      inboundConfig: inboundConfigPort,
-      adminApi: surfaceAdminApi,
-      health: surfaceHealth,
-    }).list(),
-    get: (type) => createChannelProjection({
-      outboundSource,
-      outboundConfig: outboundConfigService,
-      inboundConfig: inboundConfigPort,
-      adminApi: surfaceAdminApi,
-      health: surfaceHealth,
-    }).get(type),
-  }
-  const surfaceService = createControlSurfaceService({
-    revision: surfaceRevision,
-    channels: surfaceChannels,
-    outboundConfig: outboundConfigService,
-    saveInbound: async (type, patch) => {
-      if (typeof surfaceAdminApi?.putInboundChannel !== 'function') {
-        const error = new Error('入站配置写入能力不可用')
-        error.code = 'not-supported'
-        throw error
-      }
-      return surfaceAdminApi.putInboundChannel(type, patch)
-    },
-    channelTest: (type, raw) => runChannelTest({ type, rawConfig: raw, strings }),
-    tasks: surfaceTasks,
-    questions: surfaceQuestions,
-    activity: surfaceActivity,
-    health: surfaceHealth,
-    storageStatus: () => {
-      const boot = typeof store.bootStatus === 'function' ? store.bootStatus() : { readFailed: false }
-      const migrated = Array.isArray(configMigration.migrated) ? configMigration.migrated.length : 0
-      const status = configMigration.ok !== true
-        ? 'failed'
-        : configMigration.deferred === true
-          ? 'deferred'
-          : configMigration.already === true
-            ? 'already-complete'
-            : 'complete'
-      return {
-        ...boot,
-        migration: {
-          status,
-          migratedCount: migrated,
-          backupCreated: typeof configMigration.backupPath === 'string' && configMigration.backupPath !== '',
-          ...(configMigration.reason ? { reason: String(configMigration.reason).slice(0, 80) } : {}),
-        },
-      }
-    },
-    launchTickets,
-    adminLocation: () => adminListenInfo,
-  })
-  // v0.12：Native 通道挂在宿主 HTTP server 上（`/dsh-notifier` prefix 路由），与宿主 connection
-  // 插件挂 `/api` 同款，故注册方必须能同时访问 connection（准入）与 webServer（挂路由）。
-  // 真机 0.1.7-rc.2 已复现：宿主 `connection.rpc.handle` 自身不可用（owner ctx 未声明 webServer），
-  // 详见 src/control-surface/rpc.mjs 文件头。webServer 只在 web profile 存在，故走条件注入；
-  // tui/headless 等无 webServer 的 profile 不装配、静默降级为 Standalone。
-  const mountSurfaceRpc = (rpcCtx) => {
-    try {
-      const disposeSurfaceRpc = registerControlSurfaceRpc(rpcCtx, surfaceService)
-      if (typeof disposeSurfaceRpc === 'function') disposers.push(() => { try { disposeSurfaceRpc() } catch {} })
-      else warn('Native Control Surface 无可用宿主接缝，已降级为 Standalone')
-    } catch (error) {
-      warn('Native Control Surface RPC 装配失败，已降级为 Standalone: ' + (error instanceof Error ? error.message : String(error)))
-    }
-  }
-  if (typeof ctx?.inject === 'function') ctx.inject(['connection', 'webServer'], (webCtx) => mountSurfaceRpc(webCtx))
-  else mountSurfaceRpc(ctx)
-  disposers.push(() => {
-    surfaceRevision.dispose()
-    launchTickets.dispose()
-    adminSessions.dispose()
-  })
-
-  // v0.3.3 Web 管理台装配（设计稿 §5 + §0.5-6）：admin.enabled 开启时起 HTTP 壳 + API
-  // 函数层 + 扫码流机。admin 缺省 false → 整块零执行，存量用户行为逐字节不变（§6 兼容红线）。
-  // 军规：管理台起不来只 warn 绝不弄崩宿主插件（对齐「空配置绝不弄崩启动」家训）。
-  // apply() 保持同步（全部既有测试与宿主按同步签名调用）：server.start() 即发即忘，
-  // 失败走 catch warn；stop() 已进 disposers（内部等待未完成的 listen 后再关，天然收敛）。
-  if (adminEnabled) {
-    try {
-      // token 策略（§0.5-6）：维护批 3 阶段 2 抽到 src/assembly/admin-token.mjs
-      // resolveAdminToken（纯函数：显式/复用/首启生成 + verifyToken；详注见模块头）。
-      // 零配置首访：generated 分支额外拿到 launchToken（本次进程内有效的明文 token），
-      // 在 server 启动取得真实端口后拼接 fragment 启动链接打印；显式/复用路径恒 null。
-      const { tokenMode, launchToken, verifyToken } = resolveAdminToken({
-        store,
-        explicitToken: typeof resolved.admin.token === 'string' ? resolved.admin.token : '',
-        info,
-      })
-
-      // API 函数层（UI/CLI 共用）：注入 v0.3.2 的 router/registry、store、notifier 与
-      // 出站渠道快照（outboundConfigs 取 resolved.channels——含 store overlay 后的最终态；
-      // putChannel 运行时新写的 store 字段要到下次启动才进快照，即「重启生效」语义）。
-      // 本副本只有 QQ 通道，而 QQ 入站凭证来自本插件自己的配置行，没有网页扫码流：
-      // 空处理器表让管理台 scanChannel 按既有契约返回 501（未提供该能力），不伪造扫码。
-      const scanHandlers = {}
-      const adminApi = createAdminApi({
-        router,
-        registry,
-        store,
-        notifier,
-        channelsEnabled: () => outboundSource.types(),
-        outboundConfigs: () => Object.fromEntries(outboundSource.snapshot().map((entry) => [entry.type, entry.config])),
-        outboundConfig: outboundConfigService,
-        // 零配置首访：channelTest 支持第二参 rawConfig——testOutboundChannel 现场合并
-        // 「当前 YAML + 当前 state 出站键」后传入，保存后无需重启即可真实测试；
-        // 旧 testChannel(type) 单参路径不变，仍用启动快照 testRawConfigOf。
-        channelTest: (type, rawConfig) => runChannelTest({
-          type,
-          rawConfig: rawConfig !== undefined && rawConfig !== null ? rawConfig : testRawConfigOf(type),
-          strings,
-        }),
-        // 零配置首访：YAML 原始出站行表（type → raw row 含 type/enabled 元键，api 层自剔除）——
-        // testOutboundChannel 的即时真测合并基底（raw 原文重新 resolve，不用启动快照）。
-        yamlRawConfigs: () => Object.fromEntries(yamlRowOf),
-        scanHandlers,
-        identity, // v0.7 成员页：与 inbound 共用同一实例（store 读收敛 → 写入半秒内热生效）
-        pairing, // v0.7 配对码铸造/撤销
-        guidedProbe: () => identity.isEmpty() && allowUsers.length === 0, // 与 bus.isGuided 同口径（R5-2-P2-2）
-        stateDir,
-        logger,
-        inboundConfig: inboundConfigPort,
-        questions: questionsBridge, // 路线图阶段 2A：远程提问管理台裁决（脱敏查询 + 受保护结算）
-        control, // 结算必须经 Control Core 唯一裁决（注入同一实例，缺线即 fail-closed）
-        // v0.10 提交7：暴露 DSH 连接与任务状态——宿主上下文 + 任务投影关注判定 + 宿主
-        // 事件 registrar 快照 + 会话/提问/图片能力信号（全只读，装配期惰性闭包）。
-        ctx,
-        attentionOf,
-        hostSnapshot: () => (hostEventsRegistrar !== null ? hostEventsRegistrar.snapshot() : null),
-        questionsFallbackEnabled: questionsBridge !== null, // 插件自有 ask_user 工具已注册
-        webLocal: 'available', // 管理台本机回环（此 API 自身已在本机运行）
-        imageInput: 'unknown', // 图片入站随会话路由移除（不再向 agent 会话投递图片/文件）
-      })
-      surfaceAdminApi = adminApi
-      adminApi.testOutboundChannel = async (type) => {
-        const raw = outboundConfigService.raw(type)
-        if (raw === null || Object.keys(raw).length === 0) {
-          const error = new Error('渠道未配置')
-          error.status = 501
-          throw error
-        }
-        const result = await runChannelTest({ type, rawConfig: raw, strings })
-        surfaceHealth.recordTest(type, result)
-        surfaceRevision.touch('health')
-        return result
-      }
-      // v0.7：接通配对审计晚绑定（inbound 阶段积压的事件此刻转发 admin-audit.jsonl）
-      try {
-        pairingAuditSink = (action, detail) => adminApi.appendAudit(action, detail)
-        for (const [action, detail] of pairingAuditBacklog.splice(0)) adminApi.appendAudit(action, detail)
-      } catch { /* 审计接线失败不致命（配对功能不受影响） */ }
-      const adminServer = createAdminServer({
-        api: adminApi,
-        verifyToken,
-        verifyLaunchTicket: (ticket) => launchTickets.consume(ticket),
-        createSession: () => adminSessions.mint(),
-        verifySession: (token) => adminSessions.verify(token),
-        host: '127.0.0.1', // 红线：永不绑公网（§0.5-6，config.mjs 已写死不可配）
-        port: resolved.admin.port,
-        ui: createAdminUiHtml(resolved.lang),
-        events: eventHub, // v0.4.0 通知事件流（GET /api/events，SSE）
-        logger,
-      })
-      adminServer.start()
-        .then(({ port, address }) => {
-          adminListenInfo = { port, address }
-          // mnt 批 1：就绪行永远给出 URL/端口/token 获取方式（不再出现「重启后不知 token 从哪来」）
-          const acquireHint = tokenMode === 'explicit'
-            ? 'token 用 YAML 显式配置的 admin.token'
-            : (tokenMode === 'reused'
-                ? 'token 沿用首启打印的旧值（见首次启动日志或删 admin:token-hash 后重启再生成）'
-                : 'token 已打印到上方日志（仅此一次，请妥善保存）')
-          info(`Web 管理台已就绪: http://${address}:${port}（仅本机回环；${acquireHint}）`)
-          // 零配置首访：仅首启生成的 launchToken 拼 fragment 启动链接（token 在 # 后，
-          // 不进 query / Referer / 服务器访问日志；浏览器端验证后即清地址栏并只存
-          // sessionStorage）。端口用真实监听端口（端口冲突回退后仍指向正确实例）。
-          if (typeof launchToken === 'string' && launchToken !== '') {
-            info(`零配置启动链接（点开即入管理台，仅此一次有效输出）: http://${address}:${port}/#token=${encodeURIComponent(launchToken)}`)
-          }
-        })
-        .catch((error) => {
-          const detail = error?.code === 'EADDRINUSE'
-            ? `端口 ${resolved.admin.port} 已被占用（调整 admin.port 或释放占用进程后重启）`
-            : (error instanceof Error ? error.message : String(error))
-          warn(`Web 管理台启动失败，已跳过（插件其余功能不受影响）: ${detail}`)
-        })
-      disposers.push(() => adminServer.stop())
-    } catch (error) {
-      warn(`Web 管理台装配失败，已跳过（插件其余功能不受影响）: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
 
   ctx.effect(() => () => {
     // 聚合可 await 的清理（事件监听的 flush、通道和管理台 stop 都在此收敛）。

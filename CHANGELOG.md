@@ -1,3 +1,45 @@
+## [0.13.1-qq.18]
+
+一次功能中立的重构：砍掉自建 Web 管理台与 Native Control Surface（约 -8,000 行），
+项目/会话静音改由 DSH 原生插件设置页的 volatile 配置承载，并默认静音子智能体。
+
+### 1. 精简：移除 admin web + control-surface
+
+- 删除 src/admin/*（HTTP 壳/API/单文件 UI/SSE hub）与 src/control-surface/*
+  （Native RPC 面、各 projection）。仅 apply-mode / channel-config-migration
+  两个被入站主链/启动迁移引用的模块迁至 src/assembly/，调用点改路径。
+- index.mjs 删除两块装配及散落钩子（eventHub / surfaceRevision / Activity /
+  Health / outboundConfigService / launchTickets / adminSessions / RPC 挂载）；
+  onSend 收敛为「账本 + sent 事件」两挂；inboundRuntimeOf 接线移除。
+- 模块 85 -> 71，src 行数 24,409 -> 17,375；package.json 移除 ./client 旧导出，
+  新增 dsh.client（自带新配置页）与 @deepseek-ai/schemastery 依赖。
+- 出站推送、入站审批/提问、路由、账本、QQ 交互全部行为不变。
+
+### 2. 静音配置迁移到 DSH 原生插件页（volatile 热更新）
+
+- 新增 src/config-schema.mjs：Config 声明 muteRules（dict，值 = true | false |
+  [渠道]）并标记 .volatile()；plugin-entry.mjs 导出 Config（DSH settings
+  describe 据此暴露命名空间）。schemastery 对 object 未声明字段原样保留——
+  既有 channels/events/inbound 配置零影响。
+- 新增 src/mute-rules.mjs + event-listener.mjs 出站解析前置层：每次推送实时
+  muteRules.get()（不解构不缓存，改完即生效），优先级 会话键 > 项目键 > 原路由链。
+- 新增自带配置页 client.js：读宿主 ctx.workspaces / ctx.sessions 实时列表，
+  项目行三态按钮（默认/静音/放行）+ 会话行复选框，写入走 SettingsFormModel
+  staged Save；数据服务缺失时静默降级，绝不 park 面板。
+
+### 3. 默认静音子智能体（events.subagent，默认关）
+
+- 判定只认 session.header.origin === "subagent"（宿主规范：parentSession 不定性）。
+- push() 入口总闸：子会话的 turn/end、心跳/卡住、错误全部静默，且不再
+  registry.touch 建档（止住 route:sessions 台账被派生子任务灌满）。
+- events.subagent: true 打开后子会话与主会话走完全相同的链。
+
+### 验证
+
+- 全量语法检查、161 处相对 import 解析、入口模块加载、mock-ctx apply 冒烟通过。
+- 端到端：子/主会话各发 turn/end——默认仅主会话推送；subagent:true 两条都推。
+- muteRules 四形态解析（true/false/[渠道]/缺省）与 volatile ref 实时读验证通过。
+
 ## [0.13.1-qq.17]
 
 修复「网页问题卡片时有时无、总失效」——两个提问入口统一走原生 seam，网页与 QQ 双端同时出卡。

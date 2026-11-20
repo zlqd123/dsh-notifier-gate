@@ -198,6 +198,13 @@ export function resolveConfig(config = {}) {
     },
     approval: rawEvents.approval !== false,
     agentError: rawEvents.agentError !== false,
+    // 子智能体（session header origin === 'subagent'，判定以 origin 为准——见
+    // dsh-session types：parentSession 单独存在不定性）出站推送总开关：默认关。
+    // 关 = 子会话的一切事件线（turn/end 完成、错误、心跳/卡住）静默跳过，且不再
+    // 进 route:sessions 台账；events.subagent: true 打开后与普通会话走完全相同的
+    // kinds/muteRules/routing 链。
+    subagent: rawEvents.subagent === true
+      || (rawEvents.subagent !== null && typeof rawEvents.subagent === 'object' && rawEvents.subagent.enabled === true),
     // ---- v0.5 状态上报三键（移动指挥中心）----
     // turnStart 默认关：桌面场景每 turn 一条「任务开始」是噪音；移动场景（发完任务
     // 即离开）建议显式开启。longRunning/stall 默认开：低噪高值（15min+ 长任务心跳 /
